@@ -150,3 +150,16 @@ The current Supabase changelog lists a November 4, 2026 CLI v3 breaking change: 
 - https://supabase.com/docs/guides/database/postgres/roles
 
 No DDL, grants, policy edits, data writes, or deployment changes were performed during this verification.
+
+
+### Exact high-impact SQLite call sites for the implementation pass
+
+Line numbers below refer to the current `app/main.py` on this branch (849 lines at the time of inspection):
+
+- Generated IDs / `lastrowid`: lines 252, 273, 334, 384, 420, 438, 465, 585, 589, 618, 640, 641, 692. The purchase-items insert at line 585 consumes the purchase ID, so it must use the ID returned by the immediately preceding purchase insert in the same transaction.
+- Date expressions: lines 497–498, 683–686, 707–708, 714–715, 722–723, 765–766, 820. The reporting endpoints currently use `date(timestamp)` and `date('now')`; date-boundary behavior and timezone assumptions need tests, not just syntactic replacement.
+- Boolean literals: `active=1` appears at lines 158, 239–240, 267, 315, 320, 374, 486–491, 580, 636, 770, 793, 810, 818; `active=0` appears at line 358. These must be changed to PostgreSQL boolean comparisons/parameters.
+- SQLite-only operations: connection PRAGMAs at lines 29–30; schema introspection at 72 and 76; `executescript` at 48; quick/integrity checks at 515 and 536; WAL checkpoint at 552; SQLite sidecar and file replacement logic at 553–556.
+- SQLite-specific exception catches: lines 180, 250, 271, 333, 349, 690. PostgreSQL integrity exceptions should be translated by SQLSTATE/driver exception type while preserving the intended HTTP responses.
+
+This pinpoints the first conversion batch, but it is not itself a code migration. The application currently opens fresh SQLite connections throughout request handlers; converting only `connect()` would leave the transaction-scoped RLS context unset in most of those call sites. The implementation must pass an explicit actor/login context into each transaction (or use a rigorously scoped request unit-of-work) before RLS is relied on.

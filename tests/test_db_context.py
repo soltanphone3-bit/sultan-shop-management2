@@ -19,3 +19,15 @@ def test_branch_user_requires_branch():
     with pytest.raises(ValueError):
         RLSContext(user_id=3).validate()
     RLSContext(user_id=3, branch_id=2).validate()
+
+
+def test_empty_context_is_rejected():
+    with pytest.raises(ValueError):
+        RLSContext().validate()
+
+
+def test_context_ids_must_be_positive_integers():
+    with pytest.raises(ValueError):
+        RLSContext(user_id=0, is_owner=True).validate()
+    with pytest.raises(ValueError):
+        RLSContext(user_id=3, branch_id=-1).validate()

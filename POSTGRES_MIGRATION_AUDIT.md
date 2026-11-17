@@ -61,3 +61,19 @@ The database already has three recorded migrations: `create_sultan_shop_core_sch
 ### Current readiness status
 
 The target database schema is present and empty, but application compatibility is not implemented. No schema/data changes were made by this verification. No production credentials were retrieved or stored. The next implementation must add a PostgreSQL transaction-aware data layer, explicitly apply the `sultan_app` role and RLS context per transaction, replace SQLite-only APIs and SQL, and test on an isolated PostgreSQL instance before any production connection or deployment.
+
+
+## Supabase Advisor review (2026-11-17)
+
+A fresh Supabase Advisor run reported no security lint findings. Performance findings were:
+
+- 28 foreign keys without covering indexes (INFO). Review workload and add only useful indexes after integration tests establish query patterns: [Supabase unindexed foreign keys guidance](https://supabase.com/docs/guides/database/database-linter?lint=0001_unindexed_foreign_keys).
+- 20 RLS policies re-evaluate `current_setting()` per row (WARN). The recommended optimization is to wrap stable context lookups in scalar subqueries, e.g. `(select current_setting('sultan.branch_id', true))`, after verifying policy semantics: [RLS initplan guidance](https://supabase.com/docs/guides/database/database-linter?lint=0003_auth_rls_initplan).
+- 4 indexes reported unused. This is expected on an empty/new schema and is not a reason to drop them now.
+- 2 duplicate index pairs: `cash_closings_branch_id_business_date_key` / `ux_cash_closings_branch_date`, and `stock_product_id_branch_id_key` / `ux_stock_product_branch`. Do not remove either index until the migration history and constraints are reviewed.
+
+No advisor remediation was applied. The project is empty and the application is not yet connected, so index-usage findings are preliminary. Security advisor being clean does not certify the app's runtime authorization implementation.
+
+## Current implementation boundary
+
+The application source remains SQLite-specific. A safe conversion cannot be achieved by changing only the connection string or mechanically replacing placeholders: the authentication bootstrap, per-transaction `SET LOCAL ROLE sultan_app`, transaction-local RLS context, pooled-connection reset behavior, transaction boundaries for inventory operations, and PostgreSQL backup/restore all need coordinated changes and integration tests. The current execution environment does not provide a disposable PostgreSQL server or Docker, so those behavioral tests cannot be run here. No production schema changes were made.

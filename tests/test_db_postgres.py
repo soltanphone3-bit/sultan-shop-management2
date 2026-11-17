@@ -60,3 +60,31 @@ def test_login_context_is_transaction_local():
                    current_setting('sultan.branch_id',true) AS branch_id
         """).fetchone()
     assert row == {"login": "true", "user_id": "", "branch_id": ""}
+
+
+def test_rls_context_does_not_leak_between_pooled_transactions():
+    # The pool may hand the same physical connection to both transactions.
+    # SET LOCAL must ensure the second actor receives only their own branch.
+    with transaction(RLSContext(user_id=11, branch_id=1)) as conn:
+        first = conn.execute(
+            "SELECT branch_id FROM public.rls_context_test ORDER BY branch_id"
+        ).fetchall()
+    with transaction(RLSContext(user_id=22, branch_id=2)) as conn:
+        second = conn.execute(
+            "SELECT branch_id FROM public.rls_context_test ORDER BY branch_id"
+        ).fetchall()
+    assert first == [{"branch_id": 1}]
+    assert second == [{"branch_id": 2}]
+
+
+def test_owner_context_can_access_all_branches():
+    with transaction(RLSContext(user_id=1, is_owner=True)) as conn:
+        rows = conn.execute(
+            "SELECT branch_id FROM public.rls_context_test ORDER BY branch_id"
+        ).fetchall()
+    assert rows == [{"branch_id": 1}, {"branch_id": 2}]
+
+
+def test_missing_branch_context_fails_closed():
+    with pytest.raises(ValueError):
+        RLSContext(user_id=22, branch_id=None).validate()

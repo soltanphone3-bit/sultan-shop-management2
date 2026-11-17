@@ -423,7 +423,8 @@ async def create_sale(request:Request):
         sid=cur.lastrowid
         for p,qty,line in normalized:
             c.execute("INSERT INTO sale_items(sale_id,product_id,name,qty,unit_price,line_total,unit_cost) VALUES(?,?,?,?,?,?,?)",(sid,p["id"],p["name"],qty,p["selling_price"],line,p["purchase_price"]))
-            c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=?",(qty,p["id"],bid))
+            updated = c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=? AND quantity>=?",(qty,p["id"],bid,qty))
+            if updated.rowcount != 1: raise HTTPException(409,"تغير المخزون أثناء البيع؛ أعد المحاولة")
             c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,created_at) VALUES(?,?,?,?,?,?,?)",(p["id"],bid,u["id"],"sale",-qty,inv,now()))
         audit(c,u,"إنشاء فاتورة",inv)
     return {"id":sid,"invoice_no":inv,"subtotal":subtotal,"discount":discount,"total":total,"paid":paid,"remaining":total-paid}
@@ -484,7 +485,8 @@ async def debt_payment(did:int,request:Request):
         scope_branch(u,debt["branch_id"])
         remaining=debt["original"]-debt["paid"]
         if amount<=0 or amount>remaining: raise HTTPException(400,"قيمة الدفعة غير صالحة")
-        c.execute("UPDATE debts SET paid=paid+? WHERE id=?",(amount,did))
+        updated = c.execute("UPDATE debts SET paid=paid+? WHERE id=? AND paid+?<=original",(amount,did,amount))
+        if updated.rowcount != 1: raise HTTPException(409,"تم تسجيل دفعة أخرى؛ حدّث الرصيد وأعد المحاولة")
         c.execute("INSERT INTO debt_payments(debt_id,amount,user_id,created_at) VALUES(?,?,?,?)",(did,amount,u["id"],now()))
         audit(c,u,"دفعة دين",str(did))
     return {"ok":True}
@@ -650,8 +652,9 @@ async def create_return(sid:int,request:Request):
         scope_branch(u,sale["branch_id"])
         item=c.execute("SELECT * FROM sale_items WHERE id=? AND sale_id=?",(item_id,sid)).fetchone()
         if not item: raise HTTPException(404,"المنتج غير موجود في هذه الفاتورة")
-        already=c.execute("SELECT COALESCE(SUM(qty),0) q FROM returns WHERE sale_item_id=?",(item_id,)).fetchone()["q"]
-        if qty>item["qty"]-already: raise HTTPException(400,"كمية الإرجاع تتجاوز الكمية المتبقية")
+        lock_item=c.execute("""UPDATE sale_items SET qty=qty WHERE id=? AND sale_id=?
+            AND qty-COALESCE((SELECT SUM(qty) FROM returns WHERE sale_item_id=?),0)>=?""",(item_id,sid,item_id,qty))
+        if lock_item.rowcount != 1: raise HTTPException(409,"كمية الإرجاع تتجاوز الكمية المتبقية أو يجري إرجاعها في عملية أخرى")
         sale_discount_ratio=(float(sale["discount"])/float(sale["subtotal"])) if float(sale["subtotal"]) > 0 else 0.0
         amount=round(qty*item["unit_price"]*(1-sale_discount_ratio),2)
         cur=c.execute("INSERT INTO returns(sale_id,sale_item_id,branch_id,user_id,qty,amount,refund_method,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(sid,item_id,sale["branch_id"],u["id"],qty,amount,method,reason,now()))
@@ -702,7 +705,8 @@ async def decide_transfer(tid:int,request:Request):
         if approve:
             src=c.execute("SELECT quantity FROM stock WHERE product_id=? AND branch_id=?",(t["product_id"],t["from_branch"])).fetchone()
             if not src or src["quantity"]<t["qty"]: raise HTTPException(400,"المخزون لم يعد كافياً")
-            c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=?",(t["qty"],t["product_id"],t["from_branch"]))
+            updated = c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=? AND quantity>=?",(t["qty"],t["product_id"],t["from_branch"],t["qty"]))
+            if updated.rowcount != 1: raise HTTPException(409,"تغير المخزون أثناء اعتماد التحويل؛ أعد المحاولة")
             c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=quantity+excluded.quantity",(t["product_id"],t["to_branch"],t["qty"]))
             for branch,kind,q in [(t["from_branch"],"transfer_out",-t["qty"]),(t["to_branch"],"transfer_in",t["qty"])]:
                 c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,created_at) VALUES(?,?,?,?,?,?,?)",(t["product_id"],branch,u["id"],kind,q,f"TR-{tid}",now()))

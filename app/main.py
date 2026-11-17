@@ -6,15 +6,17 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
+from app.db import RLSContext, postgres_connect, set_request_context, reset_request_context, close_pool
 
 ROOT = Path(__file__).resolve().parent.parent
 DB = Path(os.getenv("SULTAN_DB_PATH", str(ROOT / "sultan.db"))).expanduser()
 APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+POSTGRES_MODE = bool(os.getenv("DATABASE_URL", "").strip())
 SECRET = os.getenv("SULTAN_SECRET_KEY", "").strip()
 if APP_ENV == "production" and (len(SECRET) < 32 or SECRET.startswith("REPLACE_") or SECRET == "CHANGE_THIS_SECRET_BEFORE_PUBLIC_DEPLOYMENT"):
     raise RuntimeError("Production requires a unique SULTAN_SECRET_KEY of at least 32 characters")
 INITIAL_ADMIN_PASSWORD = os.getenv("SULTAN_INITIAL_ADMIN_PASSWORD", "").strip()
-if APP_ENV == "production" and len(INITIAL_ADMIN_PASSWORD) < 12:
+if APP_ENV == "production" and not POSTGRES_MODE and len(INITIAL_ADMIN_PASSWORD) < 12:
     raise RuntimeError("Production first-run requires SULTAN_INITIAL_ADMIN_PASSWORD with at least 12 characters")
 if not SECRET:
     SECRET = secrets.token_urlsafe(48)
@@ -22,7 +24,9 @@ signer = URLSafeSerializer(SECRET, salt="sultan-session")
 app = FastAPI(title="SULTAN SHOP MANAGEMENT", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(ROOT/"app"/"static")), name="static")
 
-def connect():
+def connect(context=None):
+    if POSTGRES_MODE:
+        return postgres_connect(context)
     DB.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB, timeout=20)
     c.row_factory = sqlite3.Row
@@ -83,7 +87,36 @@ def init_db():
             first_password = INITIAL_ADMIN_PASSWORD if APP_ENV == "production" else (INITIAL_ADMIN_PASSWORD or "ChangeMe123!")
             c.execute("INSERT INTO users(username,password,full_name,role,branch_id) VALUES(?,?,?,?,?)",
                       ("admin", hash_pw(first_password), "مالك النظام", "owner", bid))
-init_db()
+def bootstrap_postgres():
+    """Create the first owner only on an empty database; never overwrite existing users."""
+    with connect(RLSContext(login=True)) as c:
+        count = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+    if count:
+        return
+    if len(INITIAL_ADMIN_PASSWORD) < 12:
+        raise RuntimeError("Empty PostgreSQL database: set SULTAN_INITIAL_ADMIN_PASSWORD (12+ chars) for first-owner bootstrap")
+    with connect(RLSContext(user_id=1, is_owner=True)) as c:
+        branch = c.execute("INSERT INTO branches(name,active) VALUES(?,?)", ("الفرع الرئيسي", True))
+        branch_id = branch.lastrowid
+        c.execute(
+            "INSERT INTO users(username,password,full_name,role,branch_id,active,permissions) VALUES(?,?,?,?,?,?,?)",
+            ("admin", hash_pw(INITIAL_ADMIN_PASSWORD), "مالك النظام", "owner", branch_id, True, ""),
+        )
+
+
+@app.on_event("startup")
+def startup_database():
+    if POSTGRES_MODE:
+        bootstrap_postgres()
+    else:
+        init_db()
+
+
+@app.on_event("shutdown")
+def shutdown_database():
+    if POSTGRES_MODE:
+        close_pool()
+
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -102,7 +135,7 @@ def current_user(request):
     if not token: raise HTTPException(401, "يرجى تسجيل الدخول")
     try: uid = signer.loads(token)["uid"]
     except (BadSignature, Exception): raise HTTPException(401, "جلسة غير صالحة")
-    with connect() as c:
+    with connect(RLSContext(login=True) if POSTGRES_MODE else None) as c:
         u = c.execute("SELECT id,username,full_name,role,branch_id,active,permissions,session_version FROM users WHERE id=?", (uid,)).fetchone()
     if not u or not u["active"]: raise HTTPException(401, "الحساب غير نشط")
     try:
@@ -113,6 +146,8 @@ def current_user(request):
     except Exception:
         raise HTTPException(401, "جلسة غير صالحة")
     user = dict(u)
+    if POSTGRES_MODE:
+        set_request_context(RLSContext(user_id=user["id"], branch_id=user["branch_id"], is_owner=(user["role"] == "owner")))
     # Enforce module permissions on the server for every API request.
     if user["role"] != "owner":
         path = request.url.path
@@ -174,10 +209,10 @@ def num(v, label):
 @app.get("/healthz")
 def healthz():
     try:
-        with connect() as c:
+        with connect(RLSContext(login=True) if POSTGRES_MODE else None) as c:
             c.execute("SELECT 1").fetchone()
         return {"status": "ok"}
-    except sqlite3.Error:
+    except (sqlite3.Error, RuntimeError):
         raise HTTPException(503, "database unavailable")
 
 @app.get("/")
@@ -191,7 +226,7 @@ async def login(request: Request, response: Response):
     ip=request.client.host if request.client else "unknown"
     stamp=now()
     failed=False
-    with connect() as c:
+    with connect(RLSContext(login=True) if POSTGRES_MODE else None) as c:
         attempt=c.execute("SELECT * FROM login_attempts WHERE ip=? AND username=?",(ip,username)).fetchone()
         if attempt and attempt["locked_until"] and attempt["locked_until"] > stamp:
             raise HTTPException(429,"محاولات كثيرة. حاول مجدداً بعد 15 دقيقة")
@@ -276,7 +311,7 @@ async def user_active(uid:int, request:Request):
     u=current_user(request); require_owner(u); d=await request.json()
     if uid==u["id"]: raise HTTPException(400,"لا يمكن تعطيل حسابك الحالي")
     with connect() as c:
-        c.execute("UPDATE users SET active=?,session_version=session_version+1 WHERE id=?",(1 if d.get("active") else 0,uid))
+        c.execute("UPDATE users SET active=?,session_version=session_version+1 WHERE id=?",(bool(d.get("active")),uid))
         audit(c,u,"تغيير حالة مستخدم",str(uid))
     return {"ok":True}
 

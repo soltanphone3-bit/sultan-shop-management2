@@ -120,14 +120,18 @@ def shutdown_database():
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
-    if request.url.path.startswith("/api/"):
-        response.headers["Cache-Control"] = "no-store"
-    return response
+    try:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+    finally:
+        if POSTGRES_MODE:
+            reset_request_context()
 
 def now(): return datetime.now().isoformat(timespec="seconds")
 def current_user(request):
@@ -356,7 +360,7 @@ def products(request:Request):
     return [dict(x) for x in rows]
 @app.post("/api/products")
 async def add_product(request:Request):
-    u=current_user(request); d=await request.json()
+    u=current_user(request); require_owner(u); d=await request.json()
     name=str(d.get("name","")).strip()
     if not name: raise HTTPException(400,"اسم المنتج مطلوب")
     bid=scope_branch(u,d.get("branch_id"))
@@ -372,7 +376,7 @@ async def add_product(request:Request):
     return {"id":pid,"barcode":barcode}
 @app.patch("/api/products/{pid}")
 async def update_product(pid:int,request:Request):
-    u=current_user(request); d=await request.json()
+    u=current_user(request); require_owner(u); d=await request.json()
     with connect() as c:
         p=c.execute("SELECT * FROM products WHERE id=?",(pid,)).fetchone()
         if not p: raise HTTPException(404,"المنتج غير موجود")
@@ -540,6 +544,8 @@ def audit_log(request:Request):
 @app.get("/api/backup")
 def backup(request:Request):
     u=current_user(request); require_owner(u)
+    if POSTGRES_MODE:
+        raise HTTPException(501, "نسخ PostgreSQL الاحتياطية تُدار عبر Supabase؛ لا يُسمح بتنزيل نسخة قاعدة البيانات من واجهة التطبيق")
     # SQLite's online backup API includes committed WAL data consistently.
     dest=ROOT/f"sultan-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
     src=sqlite3.connect(DB, timeout=20)
@@ -559,6 +565,8 @@ def backup(request:Request):
 @app.post("/api/backup/restore")
 async def restore_backup(request: Request):
     u=current_user(request); require_owner(u)
+    if POSTGRES_MODE:
+        raise HTTPException(501, "استعادة PostgreSQL تتطلب إجراءً إدارياً خارج التطبيق مع نسخة موثوقة؛ تم تعطيل استعادة ملفات SQLite")
     raw=await request.body()
     if not raw or len(raw)>100*1024*1024:
         raise HTTPException(400,"ملف النسخة الاحتياطية فارغ أو أكبر من 100 ميغابايت")

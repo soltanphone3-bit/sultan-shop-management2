@@ -161,7 +161,7 @@ def _translate_sql(sql: str) -> str:
     sql = re.sub(r"\bactive\s*=\s*0\b", "active IS FALSE", sql, flags=re.I)
     sql = re.sub(r"date\(\s*'now'\s*\)", "CURRENT_DATE", sql, flags=re.I)
     sql = re.sub(r"date\(\s*(%s)\s*\)", r"(\1)::date", sql, flags=re.I)
-    sql = re.sub(r"date\(\s*([a-zA-Z_][\w.]*?)\s*\)", r"(\1)::date", sql, flags=re.I)
+    sql = re.sub(r"date\(\s*([a-zA-Z_][\w.]*?)\s*\)", r"NULLIF(\1, '')::date", sql, flags=re.I)
     sql = re.sub(r"\(%s\s+IS\s+NULL", "(%s::bigint IS NULL", sql, flags=re.I)
     return sql
 

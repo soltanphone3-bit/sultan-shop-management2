@@ -78,7 +78,7 @@ def _get_pool() -> ConnectionPool:
                     conninfo=dsn,
                     min_size=int(os.getenv("DB_POOL_MIN", "1")),
                     max_size=int(os.getenv("DB_POOL_MAX", "8")),
-                    kwargs={"row_factory": dict_row},
+                    kwargs={"row_factory": dict_row, "prepare_threshold": None, "connect_timeout": 10, "application_name": "sultan-shop-management"},
                     open=True,
                     timeout=10,
                     max_waiting=32,

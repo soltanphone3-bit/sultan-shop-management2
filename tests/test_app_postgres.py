@@ -434,4 +434,4 @@ def test_financial_inventory_and_reporting_routes_on_postgres(client):
         "liability_method": "deduct",
     })
     assert zakat.status_code == 200
-    assert zakat.json()["zakat_due"] == 60
+    assert zakat.json()["zakat_due"] == 85

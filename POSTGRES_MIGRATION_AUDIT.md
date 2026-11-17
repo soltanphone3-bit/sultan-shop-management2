@@ -1,5 +1,7 @@
 # PostgreSQL migration audit
 
+> **Status update — 2026-11-17:** The inventory below records the initial audit and is historical; several implementation items have since been addressed on `supabase-postgres-migration`. The current code adds a PostgreSQL transaction adapter, per-request RLS context, schema/role checks, first-owner bootstrap, route integration tests, and disables SQLite file backup/restore in PostgreSQL mode. CI passes against an isolated PostgreSQL 17 database. This does **not** certify a live Supabase application connection or a Render deployment; those smoke tests remain pending. See `POSTGRES_MIGRATION_IMPLEMENTATION.md` for the current boundary.
+
 Target: Supabase project selected by the owner. Work branch: `supabase-postgres-migration`.
 
 ## Current application state

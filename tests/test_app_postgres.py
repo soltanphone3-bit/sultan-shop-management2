@@ -316,3 +316,122 @@ def test_login_sale_and_cross_branch_isolation(client):
         "items": [{"product_id": product_id, "qty": 1}],
     })
     assert cross_branch_sale.status_code == 403
+
+
+def test_financial_inventory_and_reporting_routes_on_postgres(client):
+    client.post("/api/logout")
+    login = client.post("/api/login", json={
+        "username": "admin",
+        "password": os.environ["SULTAN_INITIAL_ADMIN_PASSWORD"],
+    })
+    assert login.status_code == 200
+
+    product = client.post("/api/products", json={
+        "name": "منتج العمليات",
+        "purchase_price": 8,
+        "selling_price": 15,
+        "min_stock": 1,
+        "quantity": 10,
+    })
+    assert product.status_code == 200
+    product_id = product.json()["id"]
+
+    sale = client.post("/api/sales", json={
+        "items": [{"product_id": product_id, "qty": 2}],
+        "paid": 30,
+        "payment_method": "نقدي",
+    })
+    assert sale.status_code == 200
+    sale_id = sale.json()["id"]
+    detail = client.get(f"/api/sales/{sale_id}")
+    assert detail.status_code == 200
+    sale_item_id = detail.json()["items"][0]["id"]
+
+    expense = client.post("/api/expenses", json={
+        "title": "مصاريف اختبار",
+        "category": "تشغيل",
+        "amount": 5,
+    })
+    assert expense.status_code == 200
+
+    debt = client.post("/api/debts", json={
+        "customer": "عميل اختبار",
+        "original": 100,
+        "due_date": __import__("datetime").date.today().isoformat(),
+    })
+    assert debt.status_code == 200
+    payment = client.post(f"/api/debts/{debt.json()['id']}/payments", json={"amount": 20})
+    assert payment.status_code == 200
+
+    repair = client.post("/api/repairs", json={
+        "customer": "زبون",
+        "item": "هاتف",
+        "cost": 10,
+        "paid": 5,
+    })
+    assert repair.status_code == 200
+    assert client.patch(f"/api/repairs/{repair.json()['id']}", json={"status": "جاهز"}).status_code == 200
+
+    purchase = client.post("/api/purchases", json={
+        "items": [{"product_id": product_id, "qty": 3, "unit_cost": 8}],
+    })
+    assert purchase.status_code == 200
+    assert len(client.get("/api/purchases").json()) == 1
+
+    returned = client.post(f"/api/sales/{sale_id}/returns", json={
+        "sale_item_id": sale_item_id,
+        "qty": 1,
+        "refund_method": "نقدي",
+        "reason": "اختبار مرتجع",
+    })
+    assert returned.status_code == 200
+    assert returned.json()["refund_amount"] == 15
+
+    transfer = client.post("/api/transfers", json={
+        "from_branch": 1,
+        "to_branch": 2,
+        "product_id": product_id,
+        "qty": 1,
+    })
+    assert transfer.status_code == 200
+    decision = client.post(f"/api/transfers/{transfer.json()['id']}/decision", json={"approve": True})
+    assert decision.status_code == 200
+    assert client.get("/api/transfers").json()[0]["status"] == "approved"
+
+    today = __import__("datetime").date.today().isoformat()
+    closing = client.post("/api/cash-closings", json={
+        "business_date": today,
+        "cash_actual": 10,
+    })
+    assert closing.status_code == 200
+    assert client.get("/api/cash-closings").status_code == 200
+
+    summary = client.get("/api/reports/summary", params={"start": today, "end": today})
+    assert summary.status_code == 200
+    assert summary.json()["invoice_count"] >= 1
+    assert client.get("/api/reports").status_code == 200
+    assert client.get("/api/reports/export.csv").status_code == 200
+    workbook = client.get("/api/reports/export.xlsx")
+    assert workbook.status_code == 200
+    assert workbook.content[:2] == b"PK"
+
+    stocktake = client.post("/api/stocktake/adjust", json={
+        "product_id": product_id,
+        "branch_id": 1,
+        "actual_quantity": 11,
+        "reason": "اختبار تسوية",
+    })
+    assert stocktake.status_code == 200
+    assert client.get("/api/notifications").status_code == 200
+    zakat = client.post("/api/zakat/calculate", json={
+        "cash": 1000,
+        "bank": 1000,
+        "inventory": 1000,
+        "receivables": 500,
+        "liabilities": 100,
+        "nisab": 100,
+        "hawl_completed": True,
+        "liability_method": "deduct",
+    })
+    assert zakat.status_code == 200
+    assert zakat.json()["zakat_due"] == 60

@@ -6,15 +6,19 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
+from app.db import RLSContext, postgres_connect, set_request_context, reset_request_context, close_pool
 
 ROOT = Path(__file__).resolve().parent.parent
 DB = Path(os.getenv("SULTAN_DB_PATH", str(ROOT / "sultan.db"))).expanduser()
 APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+POSTGRES_MODE = bool(os.getenv("DATABASE_URL", "").strip())
+if APP_ENV == "production" and not POSTGRES_MODE:
+    raise RuntimeError("Production requires DATABASE_URL; SQLite is development-only")
 SECRET = os.getenv("SULTAN_SECRET_KEY", "").strip()
 if APP_ENV == "production" and (len(SECRET) < 32 or SECRET.startswith("REPLACE_") or SECRET == "CHANGE_THIS_SECRET_BEFORE_PUBLIC_DEPLOYMENT"):
     raise RuntimeError("Production requires a unique SULTAN_SECRET_KEY of at least 32 characters")
 INITIAL_ADMIN_PASSWORD = os.getenv("SULTAN_INITIAL_ADMIN_PASSWORD", "").strip()
-if APP_ENV == "production" and len(INITIAL_ADMIN_PASSWORD) < 12:
+if APP_ENV == "production" and not POSTGRES_MODE and len(INITIAL_ADMIN_PASSWORD) < 12:
     raise RuntimeError("Production first-run requires SULTAN_INITIAL_ADMIN_PASSWORD with at least 12 characters")
 if not SECRET:
     SECRET = secrets.token_urlsafe(48)
@@ -22,7 +26,9 @@ signer = URLSafeSerializer(SECRET, salt="sultan-session")
 app = FastAPI(title="SULTAN SHOP MANAGEMENT", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(ROOT/"app"/"static")), name="static")
 
-def connect():
+def connect(context=None):
+    if POSTGRES_MODE:
+        return postgres_connect(context)
     DB.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB, timeout=20)
     c.row_factory = sqlite3.Row
@@ -83,18 +89,117 @@ def init_db():
             first_password = INITIAL_ADMIN_PASSWORD if APP_ENV == "production" else (INITIAL_ADMIN_PASSWORD or "ChangeMe123!")
             c.execute("INSERT INTO users(username,password,full_name,role,branch_id) VALUES(?,?,?,?,?)",
                       ("admin", hash_pw(first_password), "مالك النظام", "owner", bid))
-init_db()
+REQUIRED_POSTGRES_COLUMNS = {
+    "branches": {"id", "name", "active"},
+    "users": {"id", "username", "password", "full_name", "role", "branch_id", "active", "permissions", "session_version"},
+    "products": {"id", "name", "category", "description", "barcode", "purchase_price", "selling_price", "min_stock", "active"},
+    "stock": {"id", "product_id", "branch_id", "quantity"},
+    "sales": {"id", "invoice_no", "branch_id", "user_id", "subtotal", "discount", "total", "paid", "payment_method", "created_at"},
+    "sale_items": {"id", "sale_id", "product_id", "name", "qty", "unit_price", "line_total", "unit_cost"},
+    "expenses": {"id", "branch_id", "user_id", "title", "category", "amount", "note", "created_at"},
+    "debts": {"id", "branch_id", "customer", "phone", "original", "paid", "due_date", "note", "created_at"},
+    "debt_payments": {"id", "debt_id", "amount", "user_id", "created_at"},
+    "repairs": {"id", "branch_id", "customer", "phone", "item", "issue", "cost", "paid", "status", "note", "created_at", "user_id"},
+    "audit": {"id", "user_id", "branch_id", "action", "details", "created_at"},
+    "stock_movements": {"id", "product_id", "branch_id", "user_id", "kind", "quantity", "reference", "note", "created_at"},
+    "purchases": {"id", "reference", "branch_id", "user_id", "total", "created_at"},
+    "purchase_items": {"id", "purchase_id", "product_id", "qty", "unit_cost"},
+    "returns": {"id", "sale_id", "sale_item_id", "branch_id", "user_id", "qty", "amount", "refund_method", "reason", "created_at"},
+    "transfers": {"id", "product_id", "from_branch", "to_branch", "qty", "status", "requested_by", "approved_by", "note", "created_at", "decided_at"},
+    "cash_closings": {"id", "branch_id", "user_id", "business_date", "cash_expected", "cash_actual", "other_payments", "expenses", "returns", "difference", "note", "created_at"},
+    "login_attempts": {"ip", "username", "attempts", "window_start", "locked_until"},
+}
+
+
+def validate_postgres_schema():
+    """Fail startup on schema drift, missing RLS, or an over-privileged app role."""
+    with connect(RLSContext(login=True)) as c:
+        role = c.execute(
+            "SELECT rolcanlogin, rolsuper, rolbypassrls FROM pg_roles WHERE rolname=?",
+            ("sultan_app",),
+        ).fetchone()
+        if not role or role["rolcanlogin"] or role["rolsuper"] or role["rolbypassrls"]:
+            raise RuntimeError("sultan_app must exist as NOLOGIN, NOSUPERUSER, NOBYPASSRLS")
+        rows = c.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema='public'"
+        ).fetchall()
+        actual = {}
+        for row in rows:
+            actual.setdefault(row["table_name"], set()).add(row["column_name"])
+        missing = {
+            table: sorted(columns - actual.get(table, set()))
+            for table, columns in REQUIRED_POSTGRES_COLUMNS.items()
+            if columns - actual.get(table, set())
+        }
+        if missing:
+            raise RuntimeError("Supabase schema is missing required columns: " + repr(missing))
+        rls = c.execute(
+            "SELECT relname, relrowsecurity FROM pg_class "
+            "JOIN pg_namespace ON pg_namespace.oid=pg_class.relnamespace "
+            "WHERE nspname='public' AND relname = ANY(?)",
+            (list(REQUIRED_POSTGRES_COLUMNS),),
+        ).fetchall()
+        protected = {row["relname"] for row in rls if row["relrowsecurity"]}
+        if protected != set(REQUIRED_POSTGRES_COLUMNS):
+            raise RuntimeError("RLS must be enabled on every application table; missing: " +
+                               repr(sorted(set(REQUIRED_POSTGRES_COLUMNS) - protected)))
+        policies = c.execute(
+            "SELECT tablename, count(*) n FROM pg_policies "
+            "WHERE schemaname='public' AND 'sultan_app'=ANY(roles) GROUP BY tablename"
+        ).fetchall()
+        covered = {row["tablename"] for row in policies}
+        if covered != set(REQUIRED_POSTGRES_COLUMNS):
+            raise RuntimeError("Missing sultan_app RLS policies on: " +
+                               repr(sorted(set(REQUIRED_POSTGRES_COLUMNS) - covered)))
+
+
+def bootstrap_postgres():
+    """Create the first owner only on an empty database; never overwrite existing users."""
+    with connect(RLSContext(login=True)) as c:
+        count = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+    if count:
+        return
+    if len(INITIAL_ADMIN_PASSWORD) < 12:
+        raise RuntimeError("Empty PostgreSQL database: set SULTAN_INITIAL_ADMIN_PASSWORD (12+ chars) for first-owner bootstrap")
+    with connect(RLSContext(user_id=1, is_owner=True)) as c:
+        branch = c.execute("INSERT INTO branches(name,active) VALUES(?,?)", ("الفرع الرئيسي", True))
+        branch_id = branch.lastrowid
+        c.execute(
+            "INSERT INTO users(username,password,full_name,role,branch_id,active,permissions) VALUES(?,?,?,?,?,?,?)",
+            ("admin", hash_pw(INITIAL_ADMIN_PASSWORD), "مالك النظام", "owner", branch_id, True, ""),
+        )
+
+
+@app.on_event("startup")
+def startup_database():
+    if POSTGRES_MODE:
+        validate_postgres_schema()
+        bootstrap_postgres()
+    else:
+        init_db()
+
+
+@app.on_event("shutdown")
+def shutdown_database():
+    if POSTGRES_MODE:
+        close_pool()
+
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
-    if request.url.path.startswith("/api/"):
-        response.headers["Cache-Control"] = "no-store"
-    return response
+    try:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+    finally:
+        if POSTGRES_MODE:
+            reset_request_context()
 
 def now(): return datetime.now().isoformat(timespec="seconds")
 def current_user(request):
@@ -102,7 +207,7 @@ def current_user(request):
     if not token: raise HTTPException(401, "يرجى تسجيل الدخول")
     try: uid = signer.loads(token)["uid"]
     except (BadSignature, Exception): raise HTTPException(401, "جلسة غير صالحة")
-    with connect() as c:
+    with connect(RLSContext(login=True) if POSTGRES_MODE else None) as c:
         u = c.execute("SELECT id,username,full_name,role,branch_id,active,permissions,session_version FROM users WHERE id=?", (uid,)).fetchone()
     if not u or not u["active"]: raise HTTPException(401, "الحساب غير نشط")
     try:
@@ -113,6 +218,8 @@ def current_user(request):
     except Exception:
         raise HTTPException(401, "جلسة غير صالحة")
     user = dict(u)
+    if POSTGRES_MODE:
+        set_request_context(RLSContext(user_id=user["id"], branch_id=user["branch_id"], is_owner=(user["role"] == "owner")))
     # Enforce module permissions on the server for every API request.
     if user["role"] != "owner":
         path = request.url.path
@@ -174,10 +281,10 @@ def num(v, label):
 @app.get("/healthz")
 def healthz():
     try:
-        with connect() as c:
+        with connect(RLSContext(login=True) if POSTGRES_MODE else None) as c:
             c.execute("SELECT 1").fetchone()
         return {"status": "ok"}
-    except sqlite3.Error:
+    except (sqlite3.Error, RuntimeError):
         raise HTTPException(503, "database unavailable")
 
 @app.get("/")
@@ -191,7 +298,7 @@ async def login(request: Request, response: Response):
     ip=request.client.host if request.client else "unknown"
     stamp=now()
     failed=False
-    with connect() as c:
+    with connect(RLSContext(login=True) if POSTGRES_MODE else None) as c:
         attempt=c.execute("SELECT * FROM login_attempts WHERE ip=? AND username=?",(ip,username)).fetchone()
         if attempt and attempt["locked_until"] and attempt["locked_until"] > stamp:
             raise HTTPException(429,"محاولات كثيرة. حاول مجدداً بعد 15 دقيقة")
@@ -276,7 +383,7 @@ async def user_active(uid:int, request:Request):
     u=current_user(request); require_owner(u); d=await request.json()
     if uid==u["id"]: raise HTTPException(400,"لا يمكن تعطيل حسابك الحالي")
     with connect() as c:
-        c.execute("UPDATE users SET active=?,session_version=session_version+1 WHERE id=?",(1 if d.get("active") else 0,uid))
+        c.execute("UPDATE users SET active=?,session_version=session_version+1 WHERE id=?",(bool(d.get("active")),uid))
         audit(c,u,"تغيير حالة مستخدم",str(uid))
     return {"ok":True}
 
@@ -321,7 +428,7 @@ def products(request:Request):
     return [dict(x) for x in rows]
 @app.post("/api/products")
 async def add_product(request:Request):
-    u=current_user(request); d=await request.json()
+    u=current_user(request); require_owner(u); d=await request.json()
     name=str(d.get("name","")).strip()
     if not name: raise HTTPException(400,"اسم المنتج مطلوب")
     bid=scope_branch(u,d.get("branch_id"))
@@ -337,7 +444,7 @@ async def add_product(request:Request):
     return {"id":pid,"barcode":barcode}
 @app.patch("/api/products/{pid}")
 async def update_product(pid:int,request:Request):
-    u=current_user(request); d=await request.json()
+    u=current_user(request); require_owner(u); d=await request.json()
     with connect() as c:
         p=c.execute("SELECT * FROM products WHERE id=?",(pid,)).fetchone()
         if not p: raise HTTPException(404,"المنتج غير موجود")
@@ -384,7 +491,8 @@ async def create_sale(request:Request):
         sid=cur.lastrowid
         for p,qty,line in normalized:
             c.execute("INSERT INTO sale_items(sale_id,product_id,name,qty,unit_price,line_total,unit_cost) VALUES(?,?,?,?,?,?,?)",(sid,p["id"],p["name"],qty,p["selling_price"],line,p["purchase_price"]))
-            c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=?",(qty,p["id"],bid))
+            updated = c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=? AND quantity>=?",(qty,p["id"],bid,qty))
+            if updated.rowcount != 1: raise HTTPException(409,"تغير المخزون أثناء البيع؛ أعد المحاولة")
             c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,created_at) VALUES(?,?,?,?,?,?,?)",(p["id"],bid,u["id"],"sale",-qty,inv,now()))
         audit(c,u,"إنشاء فاتورة",inv)
     return {"id":sid,"invoice_no":inv,"subtotal":subtotal,"discount":discount,"total":total,"paid":paid,"remaining":total-paid}
@@ -445,7 +553,8 @@ async def debt_payment(did:int,request:Request):
         scope_branch(u,debt["branch_id"])
         remaining=debt["original"]-debt["paid"]
         if amount<=0 or amount>remaining: raise HTTPException(400,"قيمة الدفعة غير صالحة")
-        c.execute("UPDATE debts SET paid=paid+? WHERE id=?",(amount,did))
+        updated = c.execute("UPDATE debts SET paid=paid+? WHERE id=? AND paid+?<=original",(amount,did,amount))
+        if updated.rowcount != 1: raise HTTPException(409,"تم تسجيل دفعة أخرى؛ حدّث الرصيد وأعد المحاولة")
         c.execute("INSERT INTO debt_payments(debt_id,amount,user_id,created_at) VALUES(?,?,?,?)",(did,amount,u["id"],now()))
         audit(c,u,"دفعة دين",str(did))
     return {"ok":True}
@@ -494,7 +603,7 @@ def dashboard(request:Request):
 def reports(request:Request):
     u=current_user(request); bid=scope_branch(u)
     with connect() as c:
-        rows=c.execute("""SELECT date(created_at) day, SUM(total) sales, COUNT(*) invoices FROM sales
+        rows=c.execute("""SELECT date(created_at) AS "day", SUM(total) sales, COUNT(*) invoices FROM sales
         WHERE (? IS NULL OR branch_id=?) GROUP BY date(created_at) ORDER BY day DESC LIMIT 30""",(bid,bid)).fetchall()
         return [dict(x) for x in rows]
 @app.get("/api/audit")
@@ -505,6 +614,8 @@ def audit_log(request:Request):
 @app.get("/api/backup")
 def backup(request:Request):
     u=current_user(request); require_owner(u)
+    if POSTGRES_MODE:
+        raise HTTPException(501, "نسخ PostgreSQL الاحتياطية تُدار عبر Supabase؛ لا يُسمح بتنزيل نسخة قاعدة البيانات من واجهة التطبيق")
     # SQLite's online backup API includes committed WAL data consistently.
     dest=ROOT/f"sultan-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
     src=sqlite3.connect(DB, timeout=20)
@@ -524,6 +635,8 @@ def backup(request:Request):
 @app.post("/api/backup/restore")
 async def restore_backup(request: Request):
     u=current_user(request); require_owner(u)
+    if POSTGRES_MODE:
+        raise HTTPException(501, "استعادة PostgreSQL تتطلب إجراءً إدارياً خارج التطبيق مع نسخة موثوقة؛ تم تعطيل استعادة ملفات SQLite")
     raw=await request.body()
     if not raw or len(raw)>100*1024*1024:
         raise HTTPException(400,"ملف النسخة الاحتياطية فارغ أو أكبر من 100 ميغابايت")
@@ -583,7 +696,7 @@ async def create_purchase(request: Request):
         cur=c.execute("INSERT INTO purchases(reference,branch_id,user_id,total,created_at) VALUES(?,?,?,?,?)",(ref,bid,u["id"],total,now()))
         for pid,qty,cost in normalized:
             c.execute("INSERT INTO purchase_items(purchase_id,product_id,qty,unit_cost) VALUES(?,?,?,?)",(cur.lastrowid,pid,qty,cost))
-            c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=quantity+excluded.quantity",(pid,bid,qty))
+            c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=stock.quantity+excluded.quantity",(pid,bid,qty))
             c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,created_at) VALUES(?,?,?,?,?,?,?)",(pid,bid,u["id"],"purchase",qty,ref,now()))
         audit(c,u,"تسجيل مشتريات",ref)
     return {"id":cur.lastrowid,"reference":ref,"total":round(total,2)}
@@ -607,12 +720,13 @@ async def create_return(sid:int,request:Request):
         scope_branch(u,sale["branch_id"])
         item=c.execute("SELECT * FROM sale_items WHERE id=? AND sale_id=?",(item_id,sid)).fetchone()
         if not item: raise HTTPException(404,"المنتج غير موجود في هذه الفاتورة")
-        already=c.execute("SELECT COALESCE(SUM(qty),0) q FROM returns WHERE sale_item_id=?",(item_id,)).fetchone()["q"]
-        if qty>item["qty"]-already: raise HTTPException(400,"كمية الإرجاع تتجاوز الكمية المتبقية")
+        lock_item=c.execute("""UPDATE sale_items SET qty=qty WHERE id=? AND sale_id=?
+            AND qty-COALESCE((SELECT SUM(qty) FROM returns WHERE sale_item_id=?),0)>=?""",(item_id,sid,item_id,qty))
+        if lock_item.rowcount != 1: raise HTTPException(409,"كمية الإرجاع تتجاوز الكمية المتبقية أو يجري إرجاعها في عملية أخرى")
         sale_discount_ratio=(float(sale["discount"])/float(sale["subtotal"])) if float(sale["subtotal"]) > 0 else 0.0
         amount=round(qty*item["unit_price"]*(1-sale_discount_ratio),2)
         cur=c.execute("INSERT INTO returns(sale_id,sale_item_id,branch_id,user_id,qty,amount,refund_method,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(sid,item_id,sale["branch_id"],u["id"],qty,amount,method,reason,now()))
-        c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=quantity+excluded.quantity",(item["product_id"],sale["branch_id"],qty))
+        c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=stock.quantity+excluded.quantity",(item["product_id"],sale["branch_id"],qty))
         c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,note,created_at) VALUES(?,?,?,?,?,?,?,?)",(item["product_id"],sale["branch_id"],u["id"],"return",qty,sale["invoice_no"],reason,now()))
         audit(c,u,"إرجاع مبيعات",f"{sale['invoice_no']} / {qty}")
     return {"id":cur.lastrowid,"refund_amount":amount}
@@ -644,9 +758,9 @@ async def request_transfer(request:Request):
 def list_transfers(request:Request):
     u=current_user(request)
     with connect() as c:
-        if u["role"]=="owner": rows=c.execute("SELECT t.*,p.name product_name,b1.name from_name,b2.name to_name FROM transfers t JOIN products p ON p.id=t.product_id JOIN branches b1 ON b1.id=t.from_branch JOIN branches b2 ON b2.id=t.to_branch ORDER BY t.id DESC").fetchall()
-        else: rows=c.execute("SELECT t.*,p.name product_name,b1.name from_name,b2.name to_name FROM transfers t JOIN products p ON p.id=t.product_id JOIN branches b1 ON b1.id=t.from_branch JOIN branches b2 ON b2.id=t.to_branch WHERE t.from_branch=? OR t.to_branch=? ORDER BY t.id DESC",(u["branch_id"],u["branch_id"])).fetchall()
-        return [dict(r) for r in rows]
+        if u["role"]=="owner": rows=c.execute("SELECT t.*,p.name product_name,b1.name from_name,b2.name to_name FROM transfers t JOIN products p ON p.id=t.product_id LEFT JOIN branches b1 ON b1.id=t.from_branch LEFT JOIN branches b2 ON b2.id=t.to_branch ORDER BY t.id DESC").fetchall()
+        else: rows=c.execute("SELECT t.*,p.name product_name,b1.name from_name,b2.name to_name FROM transfers t JOIN products p ON p.id=t.product_id LEFT JOIN branches b1 ON b1.id=t.from_branch LEFT JOIN branches b2 ON b2.id=t.to_branch WHERE t.from_branch=? OR t.to_branch=? ORDER BY t.id DESC",(u["branch_id"],u["branch_id"])).fetchall()
+        return [{**dict(r), "from_name": r["from_name"] or f"فرع #{r['from_branch']}", "to_name": r["to_name"] or f"فرع #{r['to_branch']}"} for r in rows]
 
 @app.post("/api/transfers/{tid}/decision")
 async def decide_transfer(tid:int,request:Request):
@@ -659,8 +773,9 @@ async def decide_transfer(tid:int,request:Request):
         if approve:
             src=c.execute("SELECT quantity FROM stock WHERE product_id=? AND branch_id=?",(t["product_id"],t["from_branch"])).fetchone()
             if not src or src["quantity"]<t["qty"]: raise HTTPException(400,"المخزون لم يعد كافياً")
-            c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=?",(t["qty"],t["product_id"],t["from_branch"]))
-            c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=quantity+excluded.quantity",(t["product_id"],t["to_branch"],t["qty"]))
+            updated = c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=? AND quantity>=?",(t["qty"],t["product_id"],t["from_branch"],t["qty"]))
+            if updated.rowcount != 1: raise HTTPException(409,"تغير المخزون أثناء اعتماد التحويل؛ أعد المحاولة")
+            c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=stock.quantity+excluded.quantity",(t["product_id"],t["to_branch"],t["qty"]))
             for branch,kind,q in [(t["from_branch"],"transfer_out",-t["qty"]),(t["to_branch"],"transfer_in",t["qty"])]:
                 c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,created_at) VALUES(?,?,?,?,?,?,?)",(t["product_id"],branch,u["id"],kind,q,f"TR-{tid}",now()))
             status="approved"

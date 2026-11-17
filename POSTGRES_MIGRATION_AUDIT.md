@@ -1,0 +1,167 @@
+# PostgreSQL migration audit
+
+> **Status update — 2026-11-17:** The inventory below records the initial audit and is historical; several implementation items have since been addressed on `supabase-postgres-migration`. The current code adds a PostgreSQL transaction adapter, per-request RLS context, schema/role checks, first-owner bootstrap, route integration tests, and disables SQLite file backup/restore in PostgreSQL mode. CI passes against an isolated PostgreSQL 17 database. This does **not** certify a live Supabase application connection or a Render deployment; those smoke tests remain pending. See `POSTGRES_MIGRATION_IMPLEMENTATION.md` for the current boundary.
+
+Target: Supabase project selected by the owner. Work branch: `supabase-postgres-migration`.
+
+## Current application state
+
+The current FastAPI application in `app/main.py` is SQLite-specific. It imports `sqlite3`, opens a local database file, enables SQLite PRAGMAs, initializes schema through `executescript`, and uses SQLite metadata via `PRAGMA table_info`.
+
+The request layer uses qmark placeholders (`?`), SQLite row objects, `cursor.lastrowid`, and catches `sqlite3.Error` / `sqlite3.IntegrityError`. It also uses SQLite date expressions including `date(created_at)`, `date(?)`, and `date('now')`.
+
+## Operations requiring a real PostgreSQL port
+
+- Database connection lifecycle and transaction boundaries.
+- Schema initialization and forward-only migrations (do not run SQLite DDL on PostgreSQL).
+- Insert IDs: use explicit `INSERT ... RETURNING id` at each insert that consumes the generated ID.
+- Boolean values: replace integer flags with Python booleans and PostgreSQL boolean predicates.
+- Date filtering: use PostgreSQL casts / date comparisons with correctly typed parameters.
+- Nullable filters: avoid ambiguous `? IS NULL` parameter inference; use explicit typed conditions or construct safe predicates.
+- Integrity error handling: map psycopg constraint exceptions to existing HTTP responses.
+- Row access: preserve mapping-style access used throughout the application.
+- Transaction atomicity: sale, purchase, return, transfer approval, stock movement and cash-close writes must remain atomic.
+- Concurrency: lock stock rows or use guarded updates to prevent overselling under concurrent requests.
+
+## Backup and restore
+
+The existing `/api/backup` and `/api/backup/restore` endpoints use SQLite's online backup API, SQLite integrity checks, database-file replacement, and WAL checkpointing. These endpoints cannot be carried over to PostgreSQL. Replace them with a controlled PostgreSQL dump/restore workflow (for example, server-side `pg_dump` / `pg_restore` with strict authorization, temporary-file handling, validation, and a recovery plan), or disable restore until that workflow is implemented. Never accept an uploaded SQLite file as a PostgreSQL restore.
+
+## Deployment configuration
+
+Current `requirements.txt` does not include a PostgreSQL driver. The Dockerfile and Render Blueprint still configure `SULTAN_DB_PATH=/data/sultan.db` and a persistent disk. These should only be removed after the application has been migrated and verified against PostgreSQL.
+
+For Supabase connectivity, choose the connection endpoint based on Render's network reachability. Supabase documents direct connections as IPv6 by default and the shared session pooler as IPv4-capable; use SSL. Keep the connection string only in Render's server-side environment variables, never in frontend assets or source control.
+
+## Verification required before merge or deployment
+
+1. Run unit/integration tests against an isolated PostgreSQL database with the same schema.
+2. Exercise login, permissions, branch filters, product CRUD, sale and stock decrement, purchase and stock increment, returns, transfers, debts, expenses, repairs, cash closing, reports, exports, and audit logging.
+3. Verify transaction rollback on failures and concurrent stock changes.
+4. Verify backup and restore using a disposable database and prove recovery before enabling restore in production.
+5. Confirm health checks and startup do not mutate an existing production schema unexpectedly.
+
+## Safety boundary
+
+No production schema changes, data writes, Render deployments, or changes to the `main` branch are part of this audit. The application has not yet been ported; this document is an audit checklist, not a claim that PostgreSQL support is implemented.
+
+
+## Fresh read-only verification of the selected Supabase project (2026-11-17)
+
+The selected project `cmotrerzosybbhegyitw` is currently `ACTIVE_HEALTHY` on PostgreSQL 17.11. Read-only inspection found all 18 application tables present, all with RLS enabled, and zero rows in each table at inspection time. The table names match the application's core schema. This confirms schema presence only; it does not prove that the Python application can connect or execute its workflows.
+
+The database already has three recorded migrations: `create_sultan_shop_core_schema`, `secure_backend_access_and_constraints`, and `add_backend_role_and_branch_rls`.
+
+### Important compatibility and security findings
+
+- `branches.active`, `users.active`, and `products.active` are PostgreSQL `boolean` columns with `true` defaults. The SQLite application frequently uses integer flags and predicates such as `active=1`; these must become native Python booleans / SQL boolean expressions before runtime.
+- The application schema uses `bigint GENERATED BY DEFAULT AS IDENTITY` IDs. Inserts that currently read `cursor.lastrowid` must use `RETURNING id`.
+- RLS policies are scoped to the non-login role `sultan_app`. The role has `rolbypassrls=false`; the `postgres` role has `rolbypassrls=true` and is a member of `sultan_app`. A safe runtime must explicitly switch into `sultan_app` for each transaction and set the transaction-local context values expected by the policies (`sultan.user_id`, `sultan.branch_id`, `sultan.is_owner`, and for login flows `sultan.login`). Connecting as `postgres` and leaving that role active would bypass the row-level security policies and is not an acceptable production design.
+- The policies rely on transaction-local session context. Every request transaction must set the correct context after authentication, and login must use a deliberately restricted context. Connection-pool reuse must not leak one request's identity or branch context into another request.
+- Existing RLS policies cover the 18 tables and use role `sultan_app`; they are not a substitute for the application's own authorization checks. Both layers must be tested together.
+
+### Current readiness status
+
+The target database schema is present and empty, but application compatibility is not implemented. No schema/data changes were made by this verification. No production credentials were retrieved or stored. The next implementation must add a PostgreSQL transaction-aware data layer, explicitly apply the `sultan_app` role and RLS context per transaction, replace SQLite-only APIs and SQL, and test on an isolated PostgreSQL instance before any production connection or deployment.
+
+
+## Supabase Advisor review (2026-11-17)
+
+A fresh Supabase Advisor run reported no security lint findings. Performance findings were:
+
+- 28 foreign keys without covering indexes (INFO). Review workload and add only useful indexes after integration tests establish query patterns: [Supabase unindexed foreign keys guidance](https://supabase.com/docs/guides/database/database-linter?lint=0001_unindexed_foreign_keys).
+- 20 RLS policies re-evaluate `current_setting()` per row (WARN). The recommended optimization is to wrap stable context lookups in scalar subqueries, e.g. `(select current_setting('sultan.branch_id', true))`, after verifying policy semantics: [RLS initplan guidance](https://supabase.com/docs/guides/database/database-linter?lint=0003_auth_rls_initplan).
+- 4 indexes reported unused. This is expected on an empty/new schema and is not a reason to drop them now.
+- 2 duplicate index pairs: `cash_closings_branch_id_business_date_key` / `ux_cash_closings_branch_date`, and `stock_product_id_branch_id_key` / `ux_stock_product_branch`. Do not remove either index until the migration history and constraints are reviewed.
+
+No advisor remediation was applied. The project is empty and the application is not yet connected, so index-usage findings are preliminary. Security advisor being clean does not certify the app's runtime authorization implementation.
+
+## Current implementation boundary
+
+The application source remains SQLite-specific. A safe conversion cannot be achieved by changing only the connection string or mechanically replacing placeholders: the authentication bootstrap, per-transaction `SET LOCAL ROLE sultan_app`, transaction-local RLS context, pooled-connection reset behavior, transaction boundaries for inventory operations, and PostgreSQL backup/restore all need coordinated changes and integration tests. The current execution environment does not provide a disposable PostgreSQL server or Docker, so those behavioral tests cannot be run here. No production schema changes were made.
+
+
+## Code-level migration inventory (2026-11-17)
+
+A fresh read of `app/main.py` on this branch confirms that the runtime is still SQLite-only. The file is 849 lines and contains:
+
+- 279 question-mark characters/placeholders across SQL and Python (each SQL statement must be reviewed; a blind replacement is unsafe).
+- 50 textual `connect()` occurrences and 48 `with connect() as c:` transaction/context blocks.
+- 13 `lastrowid` reads that need PostgreSQL `RETURNING id` handling.
+- 24 SQL `date(...)` expressions requiring PostgreSQL-compatible date/timestamp semantics.
+- 7 SQLite PRAGMA references, one `executescript`, and six SQLite-specific exception references.
+- 49 HTTP route decorators, including authentication, sales, stock, purchases, transfers, returns, cash closing, reports, backup/restore and audit routes.
+
+### Required conversion boundaries
+
+1. **Connection and transaction layer:** replace `sqlite3.connect`/row factory/context-manager assumptions with a PostgreSQL driver and explicit transaction lifecycle. Do not assume a connection context manager has identical commit/rollback behavior without tests.
+2. **SQL compatibility:** convert placeholders statement-by-statement; replace SQLite date functions and PRAGMAs; audit `ON CONFLICT`, boolean predicates, `INSERT OR ...` patterns, aggregates, ordering and nullable-parameter predicates.
+3. **Generated identifiers:** change all 13 insert-ID call sites to explicit `INSERT ... RETURNING id` and fetch the returned row.
+4. **Schema contract:** reconcile runtime columns with the deployed Supabase schema before switching traffic. In particular, runtime uses integer flags while Supabase has boolean `active` columns; runtime initialization currently creates a `session_version` column absent from the audited deployed schema; the audited Supabase table inventory also needs a direct column-by-column comparison for every endpoint.
+5. **Authorization/RLS:** establish the authenticated user's database context inside every transaction, switch to the restricted `sultan_app` role, set transaction-local user/branch/owner/login claims, and prove context cannot leak across pooled connections. Never run application queries as the Supabase `postgres` role.
+6. **Concurrency and business invariants:** add integration tests for concurrent stock deductions, invoice creation, returns, transfer approval, debt payments, login throttling and unique cash closings. SQLite's current serialization behavior must not be assumed to carry over.
+7. **Backup and restore:** replace SQLite file-copy/WAL restore endpoints with PostgreSQL-native dump/restore workflow; do not expose arbitrary database restore operations through an unauthenticated or weakly authorized HTTP endpoint.
+8. **Deployment cutover:** only remove the Render disk and SQLite environment variable after a tested data migration, rollback plan, backup verification and production smoke test.
+
+### Safe execution status
+
+No application code, Supabase schema, production data, Render service, or deployment configuration was changed as part of this inventory. The current branch is a migration-audit branch, not a deployable PostgreSQL release. The next implementation should be a staged refactor with an isolated PostgreSQL 17 test service in CI, beginning with a schema-contract test and a driver/transaction adapter. Do not point CI or local tests at the live Supabase project.
+
+
+## Live schema verification and corrections (2026-11-17, read-only)
+
+A fresh read-only inspection of the selected Supabase project confirmed:
+
+- 18 public base tables, 141 columns, 17 identity columns, 33 foreign-key constraints, 21 RLS policies; RLS is enabled on all 18 tables.
+- All 17 generated `id` columns use `GENERATED BY DEFAULT AS IDENTITY`. `login_attempts` is the exception: it has a composite primary key `(ip, username)` and no generated `id`.
+- The live schema **does contain** `users.session_version` (integer, NOT NULL, default 0). This corrects the earlier inventory note that it was absent. The app's SQLite initializer adds it through an ALTER TABLE compatibility step.
+- Live `active` columns on `branches`, `products`, and `users` are PostgreSQL booleans; app code currently writes and tests integer values in multiple places. These call sites must use boolean values and predicates.
+- All live public tables currently have zero rows (verified in the earlier read-only count), so there is no live business dataset to migrate at this point.
+
+### Constraint differences that must be preserved in tests
+
+The live schema enforces additional foreign keys not declared in the SQLite initializer. Confirmed examples include:
+
+- `audit`: foreign keys to `users` and `branches`.
+- `sales`: foreign key to `users` in addition to `branches`.
+- `expenses`, `repairs`, `cash_closings`: foreign key to `users` in addition to `branches`.
+- `purchases`: foreign keys to `users` and `branches`.
+- `stock_movements`: foreign keys to `users` and `branches`, in addition to `products`.
+- `returns`: foreign keys to `users` and `branches`, in addition to `sales`.
+- `transfers`: foreign keys to `products`, both branch columns, `requested_by`, and `approved_by`; the SQLite initializer declares none of these.
+
+The deployed schema has 33 foreign keys total. Any migration/schema tests must validate the deployed constraints, not merely recreate the weaker SQLite declarations. In particular, transfer and stock-movement workflows need valid user and branch references.
+
+### RLS and role verification
+
+The live project has 21 policies covering all 18 RLS-enabled tables. Policies target `sultan_app` and depend on transaction-local settings:
+
+- `sultan.user_id`, `sultan.branch_id`, `sultan.is_owner`, and `sultan.login`.
+- `login_attempts` requires the login context.
+- `users` permits login lookup, owner access, the current user, or same-branch access; writes are more restrictive.
+- `products` allows reads but restricts writes to owner context.
+- Child tables such as `sale_items`, `debt_payments`, and `purchase_items` apply branch checks through their parent rows.
+
+Role inspection confirms `sultan_app` is NOLOGIN and NOBYPASSRLS, while `postgres` is LOGIN and BYPASSRLS; the current membership relationship permits `postgres` to assume `sultan_app`. This is sufficient to reason about a transaction-local role switch, but using a superuser credential in the application remains a security concern. Before production, provision a dedicated least-privilege login role that can assume `sultan_app`, or otherwise document and harden the credential boundary. Do not run normal app queries as `postgres`.
+
+### Current Supabase platform changes checked
+
+The current Supabase changelog lists a November 4, 2026 CLI v3 breaking change: database commands now target the local stack by default, and hosted changes require explicit `--remote` plus confirmation behavior. No Supabase CLI command or hosted schema mutation was run here. The November 10, 2026 TLS cipher change applies to Supabase HTTP APIs, not direct PostgreSQL or pooler connections, so it does not alter the proposed direct-driver database path. See:
+- https://supabase.com/changelog?types=breaking-change
+- https://supabase.com/changelog/ (CLI v3 entry dated November 4, 2026)
+- https://supabase.com/docs/guides/database/postgres/roles
+
+No DDL, grants, policy edits, data writes, or deployment changes were performed during this verification.
+
+
+### Exact high-impact SQLite call sites for the implementation pass
+
+Line numbers below refer to the current `app/main.py` on this branch (849 lines at the time of inspection):
+
+- Generated IDs / `lastrowid`: lines 252, 273, 334, 384, 420, 438, 465, 585, 589, 618, 640, 641, 692. The purchase-items insert at line 585 consumes the purchase ID, so it must use the ID returned by the immediately preceding purchase insert in the same transaction.
+- Date expressions: lines 497–498, 683–686, 707–708, 714–715, 722–723, 765–766, 820. The reporting endpoints currently use `date(timestamp)` and `date('now')`; date-boundary behavior and timezone assumptions need tests, not just syntactic replacement.
+- Boolean literals: `active=1` appears at lines 158, 239–240, 267, 315, 320, 374, 486–491, 580, 636, 770, 793, 810, 818; `active=0` appears at line 358. These must be changed to PostgreSQL boolean comparisons/parameters.
+- SQLite-only operations: connection PRAGMAs at lines 29–30; schema introspection at 72 and 76; `executescript` at 48; quick/integrity checks at 515 and 536; WAL checkpoint at 552; SQLite sidecar and file replacement logic at 553–556.
+- SQLite-specific exception catches: lines 180, 250, 271, 333, 349, 690. PostgreSQL integrity exceptions should be translated by SQLSTATE/driver exception type while preserving the intended HTTP responses.
+
+This pinpoints the first conversion batch, but it is not itself a code migration. The application currently opens fresh SQLite connections throughout request handlers; converting only `connect()` would leave the transaction-scoped RLS context unset in most of those call sites. The implementation must pass an explicit actor/login context into each transaction (or use a rigorously scoped request unit-of-work) before RLS is relied on.

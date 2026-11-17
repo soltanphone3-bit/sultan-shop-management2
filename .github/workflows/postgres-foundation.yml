@@ -1,0 +1,48 @@
+name: PostgreSQL foundation tests
+
+on:
+  push:
+    branches: [supabase-postgres-migration]
+  pull_request:
+    branches: [main, supabase-postgres-migration]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sultan_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d sultan_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sultan_test
+      DB_POOL_MIN: "1"
+      DB_POOL_MAX: "2"
+      SULTAN_INITIAL_ADMIN_PASSWORD: "TestPassword123!"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt
+      - name: Compile application
+        run: python -m compileall -q app scripts
+      - name: Run test suite
+        run: python -m pytest -q
+      - name: Validate Docker Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          rm .env
+      - name: Build production Docker image
+        run: docker build --tag sultan-shop-management:test .

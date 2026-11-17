@@ -1,0 +1,18 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "10000"
+      SULTAN_DB_PATH: /data/sultan.db
+    ports:
+      - "127.0.0.1:8000:10000"
+    volumes:
+      - sultan-data:/data
+
+volumes:
+  sultan-data:

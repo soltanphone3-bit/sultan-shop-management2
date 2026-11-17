@@ -694,7 +694,7 @@ async def create_purchase(request: Request):
         cur=c.execute("INSERT INTO purchases(reference,branch_id,user_id,total,created_at) VALUES(?,?,?,?,?)",(ref,bid,u["id"],total,now()))
         for pid,qty,cost in normalized:
             c.execute("INSERT INTO purchase_items(purchase_id,product_id,qty,unit_cost) VALUES(?,?,?,?)",(cur.lastrowid,pid,qty,cost))
-            c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=quantity+excluded.quantity",(pid,bid,qty))
+            c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=stock.quantity+excluded.quantity",(pid,bid,qty))
             c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,created_at) VALUES(?,?,?,?,?,?,?)",(pid,bid,u["id"],"purchase",qty,ref,now()))
         audit(c,u,"تسجيل مشتريات",ref)
     return {"id":cur.lastrowid,"reference":ref,"total":round(total,2)}
@@ -724,7 +724,7 @@ async def create_return(sid:int,request:Request):
         sale_discount_ratio=(float(sale["discount"])/float(sale["subtotal"])) if float(sale["subtotal"]) > 0 else 0.0
         amount=round(qty*item["unit_price"]*(1-sale_discount_ratio),2)
         cur=c.execute("INSERT INTO returns(sale_id,sale_item_id,branch_id,user_id,qty,amount,refund_method,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(sid,item_id,sale["branch_id"],u["id"],qty,amount,method,reason,now()))
-        c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=quantity+excluded.quantity",(item["product_id"],sale["branch_id"],qty))
+        c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=stock.quantity+excluded.quantity",(item["product_id"],sale["branch_id"],qty))
         c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,note,created_at) VALUES(?,?,?,?,?,?,?,?)",(item["product_id"],sale["branch_id"],u["id"],"return",qty,sale["invoice_no"],reason,now()))
         audit(c,u,"إرجاع مبيعات",f"{sale['invoice_no']} / {qty}")
     return {"id":cur.lastrowid,"refund_amount":amount}
@@ -773,7 +773,7 @@ async def decide_transfer(tid:int,request:Request):
             if not src or src["quantity"]<t["qty"]: raise HTTPException(400,"المخزون لم يعد كافياً")
             updated = c.execute("UPDATE stock SET quantity=quantity-? WHERE product_id=? AND branch_id=? AND quantity>=?",(t["qty"],t["product_id"],t["from_branch"],t["qty"]))
             if updated.rowcount != 1: raise HTTPException(409,"تغير المخزون أثناء اعتماد التحويل؛ أعد المحاولة")
-            c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=quantity+excluded.quantity",(t["product_id"],t["to_branch"],t["qty"]))
+            c.execute("INSERT INTO stock(product_id,branch_id,quantity) VALUES(?,?,?) ON CONFLICT(product_id,branch_id) DO UPDATE SET quantity=stock.quantity+excluded.quantity",(t["product_id"],t["to_branch"],t["qty"]))
             for branch,kind,q in [(t["from_branch"],"transfer_out",-t["qty"]),(t["to_branch"],"transfer_in",t["qty"])]:
                 c.execute("INSERT INTO stock_movements(product_id,branch_id,user_id,kind,quantity,reference,created_at) VALUES(?,?,?,?,?,?,?)",(t["product_id"],branch,u["id"],kind,q,f"TR-{tid}",now()))
             status="approved"

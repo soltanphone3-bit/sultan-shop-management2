@@ -601,7 +601,7 @@ def dashboard(request:Request):
 def reports(request:Request):
     u=current_user(request); bid=scope_branch(u)
     with connect() as c:
-        rows=c.execute("""SELECT date(created_at) day, SUM(total) sales, COUNT(*) invoices FROM sales
+        rows=c.execute("""SELECT date(created_at) AS "day", SUM(total) sales, COUNT(*) invoices FROM sales
         WHERE (? IS NULL OR branch_id=?) GROUP BY date(created_at) ORDER BY day DESC LIMIT 30""",(bid,bid)).fetchall()
         return [dict(x) for x in rows]
 @app.get("/api/audit")

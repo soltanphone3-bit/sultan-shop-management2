@@ -77,3 +77,30 @@ No advisor remediation was applied. The project is empty and the application is 
 ## Current implementation boundary
 
 The application source remains SQLite-specific. A safe conversion cannot be achieved by changing only the connection string or mechanically replacing placeholders: the authentication bootstrap, per-transaction `SET LOCAL ROLE sultan_app`, transaction-local RLS context, pooled-connection reset behavior, transaction boundaries for inventory operations, and PostgreSQL backup/restore all need coordinated changes and integration tests. The current execution environment does not provide a disposable PostgreSQL server or Docker, so those behavioral tests cannot be run here. No production schema changes were made.
+
+
+## Code-level migration inventory (2026-11-17)
+
+A fresh read of `app/main.py` on this branch confirms that the runtime is still SQLite-only. The file is 849 lines and contains:
+
+- 279 question-mark characters/placeholders across SQL and Python (each SQL statement must be reviewed; a blind replacement is unsafe).
+- 50 textual `connect()` occurrences and 48 `with connect() as c:` transaction/context blocks.
+- 13 `lastrowid` reads that need PostgreSQL `RETURNING id` handling.
+- 24 SQL `date(...)` expressions requiring PostgreSQL-compatible date/timestamp semantics.
+- 7 SQLite PRAGMA references, one `executescript`, and six SQLite-specific exception references.
+- 49 HTTP route decorators, including authentication, sales, stock, purchases, transfers, returns, cash closing, reports, backup/restore and audit routes.
+
+### Required conversion boundaries
+
+1. **Connection and transaction layer:** replace `sqlite3.connect`/row factory/context-manager assumptions with a PostgreSQL driver and explicit transaction lifecycle. Do not assume a connection context manager has identical commit/rollback behavior without tests.
+2. **SQL compatibility:** convert placeholders statement-by-statement; replace SQLite date functions and PRAGMAs; audit `ON CONFLICT`, boolean predicates, `INSERT OR ...` patterns, aggregates, ordering and nullable-parameter predicates.
+3. **Generated identifiers:** change all 13 insert-ID call sites to explicit `INSERT ... RETURNING id` and fetch the returned row.
+4. **Schema contract:** reconcile runtime columns with the deployed Supabase schema before switching traffic. In particular, runtime uses integer flags while Supabase has boolean `active` columns; runtime initialization currently creates a `session_version` column absent from the audited deployed schema; the audited Supabase table inventory also needs a direct column-by-column comparison for every endpoint.
+5. **Authorization/RLS:** establish the authenticated user's database context inside every transaction, switch to the restricted `sultan_app` role, set transaction-local user/branch/owner/login claims, and prove context cannot leak across pooled connections. Never run application queries as the Supabase `postgres` role.
+6. **Concurrency and business invariants:** add integration tests for concurrent stock deductions, invoice creation, returns, transfer approval, debt payments, login throttling and unique cash closings. SQLite's current serialization behavior must not be assumed to carry over.
+7. **Backup and restore:** replace SQLite file-copy/WAL restore endpoints with PostgreSQL-native dump/restore workflow; do not expose arbitrary database restore operations through an unauthenticated or weakly authorized HTTP endpoint.
+8. **Deployment cutover:** only remove the Render disk and SQLite environment variable after a tested data migration, rollback plan, backup verification and production smoke test.
+
+### Safe execution status
+
+No application code, Supabase schema, production data, Render service, or deployment configuration was changed as part of this inventory. The current branch is a migration-audit branch, not a deployable PostgreSQL release. The next implementation should be a staged refactor with an isolated PostgreSQL 17 test service in CI, beginning with a schema-contract test and a driver/transaction adapter. Do not point CI or local tests at the live Supabase project.

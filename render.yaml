@@ -1,19 +1,21 @@
 services:
   - type: web
-    name: sultan-shop-management
+    name: sultan-shop-management2
     runtime: docker
+    region: frankfurt
+    plan: free
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /healthz
-    disk:
-      name: sultan-shop-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
       - key: APP_ENV
         value: production
-      - key: SULTAN_DB_PATH
-        value: /data/sultan.db
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_POOL_MIN
+        value: "1"
+      - key: DB_POOL_MAX
+        value: "5"
       - key: SULTAN_COOKIE_SECURE
         value: "1"
       - key: SULTAN_SECRET_KEY

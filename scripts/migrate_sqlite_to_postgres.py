@@ -14,6 +14,7 @@ from pathlib import Path
 
 import psycopg
 from psycopg import sql
+from psycopg.rows import dict_row
 
 
 TABLES = [
@@ -37,20 +38,23 @@ def sqlite_table_columns(source: sqlite3.Connection, table: str) -> list[str]:
     return [row["name"] for row in source.execute(f'PRAGMA table_info("{table}")')]
 
 
-def postgres_columns(target: psycopg.Connection) -> dict[str, list[str]]:
+def postgres_columns(target: psycopg.Connection):
     rows = target.execute(
         """
-        SELECT table_name, column_name
+        SELECT table_name, column_name, is_nullable, column_default,
+               is_identity, is_generated
         FROM information_schema.columns
         WHERE table_schema='public' AND table_name = ANY(%s)
         ORDER BY table_name, ordinal_position
         """,
         (TABLES,),
     ).fetchall()
-    result: dict[str, list[str]] = {name: [] for name in TABLES}
+    columns: dict[str, list[str]] = {name: [] for name in TABLES}
+    metadata = {}
     for row in rows:
-        result[row["table_name"]].append(row["column_name"])
-    return result
+        columns[row["table_name"]].append(row["column_name"])
+        metadata[(row["table_name"], row["column_name"])] = row
+    return columns, metadata
 
 
 def source_product_costs(source: sqlite3.Connection) -> dict[int, float]:
@@ -111,26 +115,34 @@ def run() -> None:
         }
         product_costs = source_product_costs(source)
 
-        with psycopg.connect(dsn, row_factory=psycopg.rows.dict_row) as target:
+        with psycopg.connect(dsn, row_factory=dict_row) as target:
             role = target.execute(
                 "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname=current_user"
             ).fetchone()
             if not role or not (role["rolsuper"] or role["rolbypassrls"]):
                 fail("Migration connection must be a PostgreSQL superuser or BYPASSRLS role.")
-            target_cols = postgres_columns(target)
+            target_cols, target_meta = postgres_columns(target)
             missing_target = [name for name in TABLES if not target_cols.get(name)]
             if missing_target:
                 fail("Target PostgreSQL schema is missing tables: " + ", ".join(missing_target))
 
+            insert_cols = {}
             for table in TABLES:
                 src_cols = set(sqlite_table_columns(source, table))
                 dst_cols = set(target_cols[table])
                 extras = sorted(src_cols - dst_cols)
                 if extras:
                     fail(f"SQLite table {table} has unmapped columns: {', '.join(extras)}")
-                for column in dst_cols - src_cols:
-                    if (table, column) not in DEFAULTS and not (table == "sale_items" and column == "unit_cost"):
-                        fail(f"SQLite table {table} is missing PostgreSQL column {column}")
+                selected = []
+                for column in target_cols[table]:
+                    if column in src_cols or (table, column) in DEFAULTS or (table == "sale_items" and column == "unit_cost"):
+                        selected.append(column)
+                        continue
+                    meta = target_meta[(table, column)]
+                    if meta["is_nullable"] == "YES" or meta["column_default"] is not None or meta["is_identity"] == "YES" or meta["is_generated"] != "NEVER":
+                        continue
+                    fail(f"SQLite table {table} is missing required PostgreSQL column {column}")
+                insert_cols[table] = selected
 
             target_counts = {
                 table: target.execute(
@@ -153,7 +165,9 @@ def run() -> None:
 
             with target.transaction():
                 for table in TABLES:
-                    columns = target_cols[table]
+                    columns = insert_cols[table]
+                    if not columns:
+                        continue
                     insert = sql.SQL("INSERT INTO {}.{} ({}) VALUES ({})").format(
                         sql.Identifier("public"),
                         sql.Identifier(table),

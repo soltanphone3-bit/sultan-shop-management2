@@ -6,10 +6,11 @@ from app.db import CompatRow, RLSContext, _translate_sql, postgres_connect
 def test_sqlite_sql_translation_for_postgres():
     sql = _translate_sql(
         "SELECT * FROM users WHERE active=1 AND date(created_at)>=date(?) "
-        "AND (? IS NULL OR branch_id=?)"
+        "AND date(created_at)=? AND (? IS NULL OR branch_id=?)"
     )
     assert "active IS TRUE" in sql
     assert "NULLIF(created_at, '')::date>=(%s)::date" in sql
+    assert "NULLIF(created_at, '')::date=%s::date" in sql
     assert "(%s::bigint IS NULL OR branch_id=%s)" in sql
 
 

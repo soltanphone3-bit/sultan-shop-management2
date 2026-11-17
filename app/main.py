@@ -756,9 +756,9 @@ async def request_transfer(request:Request):
 def list_transfers(request:Request):
     u=current_user(request)
     with connect() as c:
-        if u["role"]=="owner": rows=c.execute("SELECT t.*,p.name product_name,b1.name from_name,b2.name to_name FROM transfers t JOIN products p ON p.id=t.product_id JOIN branches b1 ON b1.id=t.from_branch JOIN branches b2 ON b2.id=t.to_branch ORDER BY t.id DESC").fetchall()
-        else: rows=c.execute("SELECT t.*,p.name product_name,b1.name from_name,b2.name to_name FROM transfers t JOIN products p ON p.id=t.product_id JOIN branches b1 ON b1.id=t.from_branch JOIN branches b2 ON b2.id=t.to_branch WHERE t.from_branch=? OR t.to_branch=? ORDER BY t.id DESC",(u["branch_id"],u["branch_id"])).fetchall()
-        return [dict(r) for r in rows]
+        if u["role"]=="owner": rows=c.execute("SELECT t.*,p.name product_name,b1.name from_name,b2.name to_name FROM transfers t JOIN products p ON p.id=t.product_id LEFT JOIN branches b1 ON b1.id=t.from_branch LEFT JOIN branches b2 ON b2.id=t.to_branch ORDER BY t.id DESC").fetchall()
+        else: rows=c.execute("SELECT t.*,p.name product_name,b1.name from_name,b2.name to_name FROM transfers t JOIN products p ON p.id=t.product_id LEFT JOIN branches b1 ON b1.id=t.from_branch LEFT JOIN branches b2 ON b2.id=t.to_branch WHERE t.from_branch=? OR t.to_branch=? ORDER BY t.id DESC",(u["branch_id"],u["branch_id"])).fetchall()
+        return [{**dict(r), "from_name": r["from_name"] or f"فرع #{r['from_branch']}", "to_name": r["to_name"] or f"فرع #{r['to_branch']}"} for r in rows]
 
 @app.post("/api/transfers/{tid}/decision")
 async def decide_transfer(tid:int,request:Request):

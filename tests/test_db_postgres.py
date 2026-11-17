@@ -29,8 +29,8 @@ def prepare_database():
         conn.execute("""
             CREATE POLICY rls_context_test_policy ON public.rls_context_test
             TO sultan_app
-            USING (branch_id = NULLIF(current_setting('sultan.branch_id', true), '')::integer)
-            WITH CHECK (branch_id = NULLIF(current_setting('sultan.branch_id', true), '')::integer)
+            USING (current_setting('sultan.is_owner', true) = 'true' OR branch_id = NULLIF(current_setting('sultan.branch_id', true), '')::integer)
+            WITH CHECK (current_setting('sultan.is_owner', true) = 'true' OR branch_id = NULLIF(current_setting('sultan.branch_id', true), '')::integer)
         """)
         conn.execute("GRANT SELECT, INSERT ON public.rls_context_test TO sultan_app")
         conn.execute("INSERT INTO public.rls_context_test VALUES (1,'one'),(2,'two')")

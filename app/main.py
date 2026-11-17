@@ -87,6 +87,71 @@ def init_db():
             first_password = INITIAL_ADMIN_PASSWORD if APP_ENV == "production" else (INITIAL_ADMIN_PASSWORD or "ChangeMe123!")
             c.execute("INSERT INTO users(username,password,full_name,role,branch_id) VALUES(?,?,?,?,?)",
                       ("admin", hash_pw(first_password), "مالك النظام", "owner", bid))
+REQUIRED_POSTGRES_COLUMNS = {
+    "branches": {"id", "name", "active"},
+    "users": {"id", "username", "password", "full_name", "role", "branch_id", "active", "permissions", "session_version"},
+    "products": {"id", "name", "category", "description", "barcode", "purchase_price", "selling_price", "min_stock", "active"},
+    "stock": {"id", "product_id", "branch_id", "quantity"},
+    "sales": {"id", "invoice_no", "branch_id", "user_id", "subtotal", "discount", "total", "paid", "payment_method", "created_at"},
+    "sale_items": {"id", "sale_id", "product_id", "name", "qty", "unit_price", "line_total", "unit_cost"},
+    "expenses": {"id", "branch_id", "user_id", "title", "category", "amount", "note", "created_at"},
+    "debts": {"id", "branch_id", "customer", "phone", "original", "paid", "due_date", "note", "created_at"},
+    "debt_payments": {"id", "debt_id", "amount", "user_id", "created_at"},
+    "repairs": {"id", "branch_id", "customer", "phone", "item", "issue", "cost", "paid", "status", "note", "created_at", "user_id"},
+    "audit": {"id", "user_id", "branch_id", "action", "details", "created_at"},
+    "stock_movements": {"id", "product_id", "branch_id", "user_id", "kind", "quantity", "reference", "note", "created_at"},
+    "purchases": {"id", "reference", "branch_id", "user_id", "total", "created_at"},
+    "purchase_items": {"id", "purchase_id", "product_id", "qty", "unit_cost"},
+    "returns": {"id", "sale_id", "sale_item_id", "branch_id", "user_id", "qty", "amount", "refund_method", "reason", "created_at"},
+    "transfers": {"id", "product_id", "from_branch", "to_branch", "qty", "status", "requested_by", "approved_by", "note", "created_at", "decided_at"},
+    "cash_closings": {"id", "branch_id", "user_id", "business_date", "cash_expected", "cash_actual", "other_payments", "expenses", "returns", "difference", "note", "created_at"},
+    "login_attempts": {"ip", "username", "attempts", "window_start", "locked_until"},
+}
+
+
+def validate_postgres_schema():
+    """Fail startup on schema drift, missing RLS, or an over-privileged app role."""
+    with connect(RLSContext(login=True)) as c:
+        role = c.execute(
+            "SELECT rolcanlogin, rolsuper, rolbypassrls FROM pg_roles WHERE rolname=?",
+            ("sultan_app",),
+        ).fetchone()
+        if not role or role["rolcanlogin"] or role["rolsuper"] or role["rolbypassrls"]:
+            raise RuntimeError("sultan_app must exist as NOLOGIN, NOSUPERUSER, NOBYPASSRLS")
+        rows = c.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema='public'"
+        ).fetchall()
+        actual = {}
+        for row in rows:
+            actual.setdefault(row["table_name"], set()).add(row["column_name"])
+        missing = {
+            table: sorted(columns - actual.get(table, set()))
+            for table, columns in REQUIRED_POSTGRES_COLUMNS.items()
+            if columns - actual.get(table, set())
+        }
+        if missing:
+            raise RuntimeError("Supabase schema is missing required columns: " + repr(missing))
+        rls = c.execute(
+            "SELECT relname, relrowsecurity FROM pg_class "
+            "JOIN pg_namespace ON pg_namespace.oid=pg_class.relnamespace "
+            "WHERE nspname='public' AND relname = ANY(?)",
+            (list(REQUIRED_POSTGRES_COLUMNS),),
+        ).fetchall()
+        protected = {row["relname"] for row in rls if row["relrowsecurity"]}
+        if protected != set(REQUIRED_POSTGRES_COLUMNS):
+            raise RuntimeError("RLS must be enabled on every application table; missing: " +
+                               repr(sorted(set(REQUIRED_POSTGRES_COLUMNS) - protected)))
+        policies = c.execute(
+            "SELECT tablename, count(*) n FROM pg_policies "
+            "WHERE schemaname='public' AND 'sultan_app'=ANY(roles) GROUP BY tablename"
+        ).fetchall()
+        covered = {row["tablename"] for row in policies}
+        if covered != set(REQUIRED_POSTGRES_COLUMNS):
+            raise RuntimeError("Missing sultan_app RLS policies on: " +
+                               repr(sorted(set(REQUIRED_POSTGRES_COLUMNS) - covered)))
+
+
 def bootstrap_postgres():
     """Create the first owner only on an empty database; never overwrite existing users."""
     with connect(RLSContext(login=True)) as c:
@@ -107,6 +172,7 @@ def bootstrap_postgres():
 @app.on_event("startup")
 def startup_database():
     if POSTGRES_MODE:
+        validate_postgres_schema()
         bootstrap_postgres()
     else:
         init_db()

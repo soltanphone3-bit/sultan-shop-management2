@@ -27,6 +27,7 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sultan_test
       DB_POOL_MIN: "1"
       DB_POOL_MAX: "2"
+      SULTAN_INITIAL_ADMIN_PASSWORD: "TestPassword123!"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

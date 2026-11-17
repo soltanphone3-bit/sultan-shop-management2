@@ -38,5 +38,10 @@ jobs:
         run: python -m compileall -q app
       - name: Run test suite
         run: python -m pytest -q
+      - name: Validate Docker Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          rm .env
       - name: Build production Docker image
         run: docker build --tag sultan-shop-management:test .

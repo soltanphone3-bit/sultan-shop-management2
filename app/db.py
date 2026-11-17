@@ -25,9 +25,21 @@ class RLSContext:
     def validate(self) -> None:
         if self.login and (self.user_id is not None or self.branch_id is not None or self.is_owner):
             raise ValueError("Login context must not carry an authenticated actor")
-        if not self.login and self.is_owner and self.user_id is None:
-            raise ValueError("Owner context requires an authenticated user_id")
-        if not self.login and not self.is_owner and self.user_id is not None and self.branch_id is None:
+        if not self.login and self.user_id is None:
+            raise ValueError("Authenticated database context requires user_id")
+        if self.user_id is not None:
+            try:
+                if int(self.user_id) <= 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise ValueError("user_id must be a positive integer")
+        if self.branch_id is not None:
+            try:
+                if int(self.branch_id) <= 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise ValueError("branch_id must be a positive integer")
+        if not self.login and not self.is_owner and self.branch_id is None:
             raise ValueError("Branch-scoped users require branch_id")
 
 

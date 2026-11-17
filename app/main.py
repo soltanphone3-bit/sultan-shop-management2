@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DB = Path(os.getenv("SULTAN_DB_PATH", str(ROOT / "sultan.db"))).expanduser()
 APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
 POSTGRES_MODE = bool(os.getenv("DATABASE_URL", "").strip())
+if APP_ENV == "production" and not POSTGRES_MODE:
+    raise RuntimeError("Production requires DATABASE_URL; SQLite is development-only")
 SECRET = os.getenv("SULTAN_SECRET_KEY", "").strip()
 if APP_ENV == "production" and (len(SECRET) < 32 or SECRET.startswith("REPLACE_") or SECRET == "CHANGE_THIS_SECRET_BEFORE_PUBLIC_DEPLOYMENT"):
     raise RuntimeError("Production requires a unique SULTAN_SECRET_KEY of at least 32 characters")

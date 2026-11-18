@@ -157,8 +157,8 @@ def _translate_sql(sql: str) -> str:
     # This codebase uses positional ? parameters and has no literal question marks
     # in SQL strings. SQL values remain bound parameters, never interpolated.
     sql = sql.replace("?", "%s")
-    sql = re.sub(r"\bactive\s*=\s*1\b", "active IS TRUE", sql, flags=re.I)
-    sql = re.sub(r"\bactive\s*=\s*0\b", "active IS FALSE", sql, flags=re.I)
+    sql = re.sub(r"\bactive\s*=\s*1\b", "active = TRUE", sql, flags=re.I)
+    sql = re.sub(r"\bactive\s*=\s*0\b", "active = FALSE", sql, flags=re.I)
     sql = re.sub(r"date\(\s*'now'\s*\)", "CURRENT_DATE", sql, flags=re.I)
     sql = re.sub(r"date\(\s*(%s)\s*\)", r"(\1)::date", sql, flags=re.I)
     sql = re.sub(r"date\(\s*([a-zA-Z_][\w.]*?)\s*\)", r"NULLIF(\1, '')::date", sql, flags=re.I)
